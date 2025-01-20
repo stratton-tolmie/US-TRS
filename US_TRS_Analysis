@@ -1,0 +1,1537 @@
+---
+title: "01_post_tx_surv_prediction"
+authors: "Kevin Lazenby, Stratton Tolmie, Kenley Barrett"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(tidymodels)
+library(here)
+library(haven)
+library(sas7bdat)
+library(ggh4x)
+library(reticulate)
+library(lubridate)
+library(splines)
+library(Hmisc)
+library(knitr)
+library(ggrcs)
+library(cowplot)
+library(lemon)
+library(pROC)
+library(gtsummary)
+library(boot)
+library(consort)
+library(grid)
+library(gt)
+library(flextable)
+library(labelled)
+library(dtplyr)
+library(rms)
+library(data.table)
+library(coxme)
+library(zoo)
+library(riskRegression)
+library(adjustedCurves)
+library(cvwrapr)
+library(devtools)
+library(survminer)
+library(ggplot2)
+
+tidymodels_prefer()
+set.seed(2023)
+
+here::i_am("01_post_tx_surv_prediction_changed_for_publication.Rmd")
+
+```
+
+## Function definitions used in later analysis
+
+```{r function definitions}
+
+custom_theme <- function() {
+  theme_light() %+replace%
+    theme(
+    panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+    strip.background = element_blank()
+    )
+}
+
+```
+
+## Load in data
+
+```{r}
+
+curr_data_release <- "pubsaf2403"
+time_of_tx_file_prefix <- "at_tx_dataset_"
+end_cohort_date <- "3_1_22"
+RData_suffix <- ".RData"
+
+raw_data_filename <- paste0(curr_data_release, "_raw_heart_data.RData")
+
+load('raw_heart_data.RData')
+
+rm(stat_just_hr1a, stat_just_hr1b, status_just_episode, thor_support_device,
+   table_descriptions, column_descriptions, just_form_hr,
+   just_form_hr_data_link, just_form_hr_stat1, just_form_hr_stat2,
+   just_form_hr_stat3, just_form_hr_stat4, risk_strat_data_hr,
+   stathist_thor, cand_thor)
+
+load('at_tx_dataset_3_1_22.RData')
+
+final_list_at_tx <- final_list_at_tx |> 
+  mutate(incomplete_fu = if_else(surv_status_365 == 0 & surv_time_365 < 365, 1, 0))
+```
+
+# Count number that will be removed by filters
+```{r}
+
+tx_hr_print <- tx_hr
+
+nrow(tx_hr_print)
+
+tx_hr_print <- tx_hr_print |> 
+  
+  # Remove recipients transplanted before policy change
+  filter(REC_TX_DT >= mdy("10-18-2018"))
+
+tx_hr_starting <- tx_hr_print |> 
+  
+  # Remove recipients transplanted on or after March 1, 2022
+  filter(REC_TX_DT < mdy("3-1-2022"))
+
+print('Starting number from 10-18-2018 to 3-1-2022')
+print(nrow(tx_hr_starting))
+
+starting_number <- nrow(tx_hr_starting)
+
+tx_hr_filtered_list_date <- tx_hr_starting |> 
+  
+  # Remove recipients listed prior to policy change
+  filter(CAN_LISTING_DT >= mdy("10-18-2018"))
+
+removed_early_listing <- starting_number - nrow(tx_hr_filtered_list_date)
+print('Number removed because they were listed prior to 10-18-2018')
+print(removed_early_listing)
+
+tx_hr_filtered_peds <- tx_hr_starting |> 
+  
+  # Remove recipients who were < 18 yrs old at listing
+  filter((CAN_AGE_IN_MONTHS_AT_LISTING / 12) >= 18)
+
+removed_peds <- starting_number - nrow(tx_hr_filtered_peds)
+print('Number removed because they were less than 18 at listing')
+print(removed_peds)
+
+tx_hr_old_status <- tx_hr_starting |> 
+  
+  # Remove recipients with an initial status or last status from old policy
+  filter((CAN_INIT_STAT %in% c(2010, 2020, 2030) | (CAN_LAST_STAT %in% c(2010, 2020, 2030))))
+
+old_status_error <- tx_hr_old_status |> filter((CAN_AGE_IN_MONTHS_AT_LISTING / 12) >= 18) |> filter(CAN_LISTING_DT >= mdy("10-18-2018"))
+
+removed_erroneous_old_status <- nrow(old_status_error)
+
+print('Removed due to an initial or final status being under Status 1A/1B/2, for non-pediatric patients listed after 10-18-18')
+print(removed_erroneous_old_status)
+
+tx_hr_missing_center <- tx_hr_starting |> 
+  
+  mutate(center_id = REC_CTR_CD) |> 
+  
+  # Remove candidates with missing center ID
+  filter(is.na(center_id))
+
+removed_missing_center <- nrow(tx_hr_missing_center)
+print('Removed due to a missing center ID')
+print(removed_missing_center)
+
+# Remove recipients with obvious height and weight data entry errors
+data_error_PX_IDs <- tx_hr_starting |> 
+  filter(REC_BMI > 50 | REC_BMI < 10) |> 
+  pull(PX_ID)
+
+tx_hr_filtered_bad_height_weight <- tx_hr_starting |> 
+  filter(!(PX_ID %in% data_error_PX_IDs))
+
+removed_bad_weight_height <- starting_number - nrow(tx_hr_filtered_bad_height_weight)
+print('Removed due to bad data for height or weight')
+print(removed_bad_weight_height)
+
+errors_removed <- tx_hr_starting |> filter(!(PX_ID %in% old_status_error$PX_ID)) |> filter(!(PX_ID %in% tx_hr_missing_center$PX_ID)) |> filter(!(PX_ID %in% data_error_PX_IDs))
+print(nrow(tx_hr_starting) - nrow(errors_removed))
+
+```
+
+
+# Filtering TX_HR for reference
+
+```{r}
+tx_hr_raw <- tx_hr
+
+tx_hr <- tx_hr |> 
+  
+  # Remove recipients transplanted before policy change
+  filter(REC_TX_DT >= mdy("10-18-2018"))
+
+tx_hr <- tx_hr |> 
+  
+  # Remove recipients transplanted on or after March 1, 2022
+  filter(REC_TX_DT < mdy("3-1-2022"))
+
+tx_hr <- tx_hr |> 
+  
+  # Remove recipients listed prior to policy change
+  filter(CAN_LISTING_DT >= mdy("10-18-2018"))
+
+tx_hr <- tx_hr |> 
+  
+  # Remove recipients who were < 18 yrs old at listing
+  filter((CAN_AGE_IN_MONTHS_AT_LISTING / 12) >= 18)
+
+tx_hr <- tx_hr |>
+  
+  # Remove recipients with an initial status or last status from old policy
+  filter(!(CAN_INIT_STAT %in% c(2010, 2020, 2030)))  |>  
+  filter(!(CAN_LAST_STAT %in% c(2010, 2020, 2030)))
+
+tx_hr <- tx_hr |> 
+  
+  mutate(center_id = REC_CTR_CD) |> 
+  
+  # Remove candidates with missing center ID
+  filter(!is.na(center_id))
+
+# Remove recipients with obvious height and weight data entry errors
+data_error_PX_IDs <- tx_hr |> 
+  filter(REC_BMI > 50 | REC_BMI < 10) |> 
+  pull(PX_ID)
+
+tx_hr <- tx_hr |> 
+  filter(!(PX_ID %in% data_error_PX_IDs))
+ 
+rec_PX_IDs <- tx_hr |> pull(PX_ID)
+
+final_list_at_tx <- final_list_at_tx |> left_join(
+  tx_hr |> select(CAN_ETHNICITY_SRTR, CAN_RACE_SRTR, PX_ID), by = "PX_ID") |> 
+  mutate(ethnicity = if_else(CAN_ETHNICITY_SRTR == "LATINO", 1, 0)) |> 
+  mutate(ethnicity = factor(ethnicity, levels = c(0, 1),
+                           labels = c("Not Hispanic or Latino",
+                                      "Hispanic or Latino"))) |> 
+  mutate(race = case_when(
+    CAN_RACE_SRTR == "WHITE" ~ 1,
+    CAN_RACE_SRTR == "BLACK" ~ 2,
+    CAN_RACE_SRTR == "ASIAN" ~ 3,
+    CAN_RACE_SRTR == "NATIVE" ~ 4,
+    CAN_RACE_SRTR == "PACIFIC" ~ 5,
+    CAN_RACE_SRTR == "MULTI" ~ 6)) |> 
+  
+  mutate(race = factor(race,
+                       levels = c(1, 2, 3, 4, 5, 6),
+                       labels = c("White",
+                                  "Black",
+                                  "Asian",
+                                  "Native American",
+                                  "Pacific Islander",
+                                  "Multiracial")))
+
+```
+
+```{r} 
+
+tx_hr <- read_sas("tx_hr.sas7bdat", NULL) %>%  
+    zap_formats() %>% zap_labels()
+
+tx_hr_multi <- tx_hr |> select(PX_ID, REC_TX_TY)
+
+final_list_at_tx <- final_list_at_tx |> 
+  
+left_join(tx_hr_multi, by="PX_ID") |>
+  
+mutate(multi_organ = case_when((REC_TX_TY == 2 | REC_TX_TY == 4) ~ 1, TRUE ~ 0))
+
+```
+
+## Data Splitting
+# Input data is created by heart_data_pipeline.Rmd and 00_data_preparation.Rmd
+
+```{r splitting data}
+
+set.seed(2023)
+
+# Temporal split
+final_list_at_tx <- final_list_at_tx |> arrange(tx_date)
+
+data_split_temporal <- initial_time_split(final_list_at_tx, prop = 0.70)
+data_train_temporal <- training(data_split_temporal)
+data_test_temporal  <- testing(data_split_temporal)
+
+training_start_date <- data_train_temporal |> pull(tx_date) |> min()
+training_end_date <- data_train_temporal |> pull(tx_date) |> max()
+testing_start_date <- data_test_temporal |> pull(tx_date) |> min()
+testing_end_date <- data_test_temporal |> pull(tx_date) |> max()
+
+```
+
+#Count number of patients who died after separating into training/test
+```{r}
+print('Number who died, training cohort')
+print(sum(data_train_temporal$surv_status_365))
+print('Number who died, test cohort')
+print(sum(data_test_temporal$surv_status_365))
+```
+
+# Exploratory univariate regression with data at transplant in training set
+
+```{r}
+
+run_exploratory_analysis <- TRUE
+
+if (run_exploratory_analysis == TRUE) {
+  
+  uv_reg_table <- data_train_temporal |>
+    select(surv_status_365, surv_time_365,
+           curr_list_status_factor,
+           waitlist_time, 
+           PCWP, SVO2, cardiac_index, resting_HR, 
+           systolicBP, diastolicBP, PASP, PADP, MPAP, dpg, api, 
+           cpo, papi, central_venous_pressure,
+           arterial_lactate,
+           AST,
+           eGFR_10, 
+           log_eGFR,
+           creatinine,
+           BUN_Cr_ratio,
+           bilirubin,
+           log_bilirubin, albumin, 
+           sodium,
+           BNP,
+           BUN_10,
+           log_BUN,
+           INR,
+           LDH, 
+           HemoHemoglobin,
+           IV_inotropes_ever,
+           IABP_ever,
+           ECMO, ECMO_ever,
+           durable_LVAD, 
+           durable_LVAD_ever,
+           short_MCS_ever,
+           diagnosis_factor,
+           diagnosis_limited_factor,
+           tx_indication_factor,
+           congenital_or_valvular_factor,
+           ischemic,
+           congenital,
+           retransplant,
+           diabetes, dialysis,
+           cand_sex_factor, 
+           female_don_male_rec, 
+           mech_vent, 
+           infection,
+           rec_age_10, transfusion,
+           IMPACT_score, rec_height_10, 
+           rec_weight_10, 
+           rec_BMI,
+           hx_card_surg, hx_card_surg_limited_factor,
+           prior_CABG,
+           can_cvd, 
+           can_malig, 
+           rec_cmv_stat, rec_hiv_stat, rec_ebv_stat,
+           rec_hbv_ab, 
+           rec_hbv_sa, rec_hcv_stat, rec_abo,
+           rec_func_stat_under30,
+           donor_age_over_55,
+           donor_COD_factor,
+           donor_death_mech_factor,
+           don_height_10,
+           don_weight_10,
+           PHM_ratio,
+           donor_age_10, 
+           donor_sex, donor_creatinine, donor_diabetes, donor_HTN, donor_smoking,
+           donor_cocaine_use, donor_CMV, donor_cancer_hist
+    ) |> 
+    tbl_uvregression(
+      method = coxph,
+      y = Surv(surv_time_365, surv_status_365),
+      exponentiate = TRUE,
+      pvalue_fun = ~style_pvalue(.x, digits = 2)) |>
+    add_q() |>         # adjusts global p-values for multiple testing
+    bold_p() |>
+    bold_p(t = 0.05, q = TRUE) |>
+    bold_labels()
+  
+  uv_reg_table |> as_flex_table()
+  
+  uv_reg_table |> as_gt() |> gtsave(filename = "us_trs_uv_reg.rtf")
+}
+
+```
+
+# US-TRS: Cox mixed effects model with center random effects
+
+```{r}
+
+us_trs <- coxph(Surv(surv_time_365, surv_status_365) ~
+                   
+                   # Demographics and medical history
+                   rcs(rec_age_10) +
+                   congenital +
+                   diabetes +
+                   
+                   # Treatments
+                   mech_vent +
+                   durable_LVAD +
+                  
+                   # Labs
+                   rcs(eGFR_10) +
+                   log_bilirubin +
+                   albumin +
+                   
+                   # Donor variables
+                   donor_age_over_55 +
+                   donor_sex +
+                   PHM_ratio_undersized +
+                   
+                   # Transplant center random effects
+                   frailty(center_id),
+                 
+                 data = data_train_temporal,
+                x = TRUE)
+
+summary(us_trs)
+
+us_trs |> tbl_regression(exponentiate = TRUE) |>
+  as_gt() |>
+  gtsave(filename = "us_trs_model_coef.rtf")
+
+us_trs_coef <- data.frame(us_trs$coefficients)
+write.csv(us_trs_coef, file="us_trs_coef.csv")
+
+```
+
+
+
+# Additional models
+
+```{r}
+
+french_trs <- coxph(Surv(surv_time_365, surv_status_365) ~
+                   
+                   # Demographics and medical history
+                   age_over_50 +
+                   congenital_or_valvular +
+                   diabetes +
+                   hx_card_surg +
+                     
+                   # Treatments
+                   mech_vent +   
+                   
+                   # Labs
+                   log_eGFR +
+                   log_bilirubin +
+                   
+                   # Donor variables
+                   donor_age_over_55 +
+                   donor_sex +
+                   
+                   # Transplant center random effects
+                   frailty(center_id),
+                 
+                 data = data_train_temporal,
+                x = TRUE)
+
+# summary(french_trs)
+
+french_trs |> tbl_regression(exponentiate = TRUE) |>
+  as_gt() |>
+  gtsave(filename = "french_trs_model_coef.rtf")
+
+refitted_impact_cox <- coxph(Surv(surv_time_365, surv_status_365) ~
+                      
+                      age_over_60_factor +
+                      bilirubin_binned_factor +
+                      eGFR_binned_factor +
+                      dialysis_factor +
+                      cand_sex_factor +
+                      IMPACT_diagnosis_factor +
+                      infection_factor + 
+                      IABP_factor +
+                      mech_vent_factor +
+                      race_ethnicity_factor +
+                      IMPACT_VAD_factor +
+                      temp_circ_supp_factor,
+                    
+                    data = data_train_temporal)
+
+refitted_impact_cox |> tbl_regression(exponentiate = TRUE) |>
+  as_gt() |>
+  gtsave(filename = "refitted_impact_model_coef.rtf")
+
+# summary(refitted_impact_cox)
+
+impact_score_cox <- coxph(Surv(surv_time_365, surv_status_365) ~
+                      
+                      IMPACT_score,
+                    
+                    data = data_train_temporal)
+
+impact_score_cox |> tbl_regression(exponentiate = TRUE) |>
+  as_gt() |>
+  gtsave(filename = "calculated_impact_model_coef.rtf")
+
+# summary(impact_score_cox)
+
+waitlist_status_cox <- coxph(Surv(surv_time_365, surv_status_365) ~
+                      
+                      curr_list_status_factor,
+                    
+                    data = data_train_temporal)
+
+waitlist_status_cox |> tbl_regression(exponentiate = TRUE) |>
+  as_gt() |>
+  gtsave(filename = "waitlist_status_model_coef.rtf")
+
+# summary(waitlist_status_cox)
+
+us_trs_with_card_surg <- coxph(Surv(surv_time_365, surv_status_365) ~
+                   
+
+                   rcs(rec_age_10) +
+                   rcs(eGFR_10) +
+                   congenital +
+                   diabetes +
+                   mech_vent +
+                   durable_LVAD +
+                   log_bilirubin +
+                   albumin +
+                   donor_age_over_55 +
+                   donor_sex +
+                   PHM_ratio_undersized +
+                   hx_card_surg +
+                   
+                   # Transplant center random effects
+                   frailty(center_id),
+                 
+                 data = data_train_temporal,
+                x = TRUE)
+
+us_trs_with_card_surg |> tbl_regression(exponentiate = TRUE) |>
+  as_gt() |>
+  gtsave(filename = "us_trs_with_card_surg_model_coef.rtf")
+
+
+us_trs_with_card_surg_coef <- data.frame(us_trs_with_card_surg$coefficients)
+write.csv(us_trs_with_card_surg_coef, file="us_trs_coef.csv")
+
+summary(us_trs_with_card_surg)
+```
+
+
+```{r}
+# US TRS in test set
+print('US-TRS, test set')
+print(concordance(us_trs, newdata = data_test_temporal, timewt="n/G2"))
+
+# French TRS in test set
+print('French TRS, test set')
+print(concordance(french_trs, newdata = data_test_temporal, timewt="n/G2"))
+
+# Calculated IMPACT score in test set
+print('Calculated IMPACT score, test set')
+print(concordance(impact_score_cox, newdata = data_test_temporal, timewt="n/G2"))
+
+# Refitted IMPACT model in test set
+print('Refitted IMPACT, test set')
+print(concordance(refitted_impact_cox, newdata = data_test_temporal, timewt="n/G2"))
+
+# Waitlist status in test set
+print('Waitlist status, test set')
+print(concordance(waitlist_status_cox, newdata = data_test_temporal, timewt="n/G2"))
+
+```
+
+#Manually enter c-indices and their standard deviations
+```{r}
+compare_c <- data.frame(model_name = c('Waitlist status', 'Refitted IMPACT score', 'Calculated IMPACT score',  'French-TRS score', 'US-TRS score'), c_index = c(0.5509, 0.6463, 0.5982,  0.6204, 0.6742), c_se = c(0.01775, 0.01722, 0.01815,  0.01749, 0.01623))
+
+compare_c <- compare_c |> mutate(lower_CI = c_index - 1.96*c_se) |> mutate(upper_CI = c_index + 1.96*c_se)
+```
+
+```{r, warning=F, echo=F, message=F, comment=NA, fig.align='center', fig.height=3, fig.width=6}
+
+forest_c <- compare_c %>%
+  ggplot(aes(x=c_index, 
+             y=factor(model_name, 
+                      levels = c('Waitlist status', 'Refitted IMPACT score', 'Calculated IMPACT score',  'French-TRS score', 'US-TRS score')))) +
+  geom_point(size = 3.25) +
+  geom_errorbarh(aes(xmin = lower_CI, xmax = upper_CI), height=0.4) +
+  xlab(bquote("Uno's c-index")) +
+  xlim(0.45, 0.75) +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.title.x = element_text(size = 14, margin = margin(t=5)), 
+        axis.text.x = element_text(size = 14, margin = margin(t=5)), 
+        axis.title.y = element_blank(),
+        axis.text.y = element_text(size = 14, margin = margin(r=5)),
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 14),
+        plot.caption = element_text(hjust=0, size = 12))
+
+ggsave("forest_plot_c_indices.png", height=3, width=6)
+
+forest_c
+```
+
+
+
+# RMST in test set and calculate US TRS 10-point score
+
+```{r}
+
+us_trs_predicted <- predictCox(us_trs, times = seq(1, 365, 1),
+                               newdata = data_test_temporal,
+                               keep.times = TRUE)
+
+survival_estimates <- us_trs_predicted$survival |> as.data.frame()
+
+init_surv_probs <- data.frame(time_0 = rep_len(1, length(data_test_temporal$PX_ID)))
+
+survival_estimates <- bind_cols(init_surv_probs, survival_estimates) |> as.matrix()
+
+data_test_temporal$rmst_test <- rep_len(0, length(data_test_temporal$PX_ID))
+
+for (i in seq(1:length(data_test_temporal$PX_ID))) {
+  temp_var <- integrate(function(x) {survival_estimates[i, x]}, 
+            lower = 1,
+            upper = 366,
+            subdivisions = 365)
+  
+  data_test_temporal$rmst_test[i] <- temp_var$value
+}
+
+# Histogram of RMST
+data_test_temporal |> ggplot(mapping = aes(x = rmst_test)) +
+  geom_histogram(bins = 50, center = 0, color = "black", fill = "gray") +
+  theme_bw() + 
+    theme(
+    panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+    axis.title.x = element_text(size = 15, margin = margin(t=5)), 
+    axis.text.x = element_text(size = 15, margin = margin(t=5)), 
+    axis.title.y = element_text(size = 15, margin = margin(r=5)),
+    axis.text.y = element_text(size = 14, margin = margin(r=5)),
+    legend.title = element_text(size = 15),
+    legend.text = element_text(size = 15),
+    strip.text = element_text(size = 16, face = 'bold', color = 'black'),
+    strip.background = element_blank())   +
+  xlab("Restricted mean survival time (days)") +
+  ylab("Number of recipients") +
+  scale_x_continuous(breaks = c(90, 180, 270, 360))
+
+ggsave("histogram_of_rmst.png")
+
+# Compare to Riemann sums by hand
+time_steps <- rep_len(1, 365)
+rmst_calc_by_hand <- (survival_estimates * time_steps) |> rowSums()
+
+data_test_temporal <- data_test_temporal %>%
+  mutate(US_TRS_score = rmst_test/36.5,
+         US_TRS_decile = cut_number(rmst_test, n = 10, labels = FALSE))
+
+# Histogram of US TRS score
+data_test_temporal |> ggplot(mapping = aes(x = US_TRS_score)) +
+  geom_histogram(bins = 50, center = 0, color = "black", fill = "gray") +
+  scale_x_continuous(n.breaks = 8) +
+  theme_bw() + 
+    theme(
+    panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+    axis.title.x = element_text(size = 15, margin = margin(t=5)), 
+    axis.text.x = element_text(size = 15, margin = margin(t=5)), 
+    axis.title.y = element_text(size = 15, margin = margin(r=5)),
+    axis.text.y = element_text(size = 15, margin = margin(r=5)),
+    legend.title = element_text(size = 15),
+    legend.text = element_text(size = 15),
+    strip.text = element_text(size = 15, face = 'bold', color = 'black'),
+    strip.background = element_blank())   +
+  xlab("US TRS Score") +
+  ylab("Number of recipients")
+
+ggsave("histogram_of_us_trs_score.png")
+
+```
+
+
+#Create dataframe of hazard ratios for US-TRS that will be used for forest plots
+```{r}
+#Create four fictional patients of ages 40, 50, 60, 70, and compute their risks to calculate the hazard ratio of ages 50, 60, and 70 relative to 40
+#Do the same thing with GFR values of 0, 20, 40, 60, 100
+
+#Arbitrarily picking the first row from the test set for patient data, and setting to age/GFR variables
+patient40 <- data_test_temporal[1,]
+patient40$rec_age_10 <- 4
+patient40$age_over_50 <- 0
+patient50 <- data_test_temporal[1,]
+patient50$rec_age_10 <- 5
+patient50$age_over_50 <- 0
+patient60 <- data_test_temporal[1,]
+patient60$rec_age_10 <- 6
+patient60$age_over_50 <- 1
+patient70 <- data_test_temporal[1,] 
+patient70$rec_age_10 <- 7
+patient70$age_over_50 <- 1
+patientGFR_0 <- data_test_temporal[1,]
+patientGFR_0$eGFR_10 <- 0
+patientGFR_0$log_eGFR <- log1p(0)
+patientGFR_20 <- data_test_temporal[1,]
+patientGFR_20$eGFR_10 <- 2
+patientGFR_20$log_eGFR <- log1p(20)
+patientGFR_40 <- data_test_temporal[1,]
+patientGFR_40$eGFR_10 <- 4
+patientGFR_40$log_eGFR <- log1p(40)
+patientGFR_60 <- data_test_temporal[1,]
+patientGFR_60$eGFR_10 <- 6
+patientGFR_60$log_eGFR <- log1p(60)
+patientGFR_100 <- data_test_temporal[1,]
+patientGFR_100$eGFR_10 <- 10
+patientGFR_100$log_eGFR <- log1p(100)
+
+#Create age-only dataframe
+patients <- rbind(patient40, patient50, patient60, patient70)
+risks <- predict(us_trs, newdata=patients, type="risk", se.fit=TRUE)
+age_hazards <- as.data.frame(risks)
+age_hazards$variable = rbind('Age 40', 'Recipient Age 50 [v. 40]', 'Recipient Age 60 [v. 40]', 'Recipient Age 70 [v. 40]')
+risk40 = age_hazards$fit[1]
+age_hazards <- age_hazards %>% mutate(estimate = fit/risk40) %>% mutate(lower_CI = estimate - (1.96*se.fit)) %>% mutate(upper_CI = estimate + (1.96*se.fit)) 
+age_coefplot <- select(age_hazards, c("estimate", "lower_CI", "upper_CI", "variable"))[2:4,]
+
+#Create GFR-only dataframe
+patients_GFR <- rbind(patientGFR_100, patientGFR_60, patientGFR_40, patientGFR_20, patientGFR_0)
+risks_GFR <- predict(us_trs, newdata=patients_GFR, type="risk", se.fit=TRUE)
+gfr_hazards <- as.data.frame(risks_GFR)
+gfr_hazards$variable = rbind('eGFR=100', 'eGFR=60 [v. 100]', 'eGFR=40 [v. 100]', 'eGFR=20 [v. 100]', 'eGFR=0 [v. 100]')
+risk100 = gfr_hazards$fit[1]
+gfr_hazards <- gfr_hazards %>% mutate(estimate = fit/risk100) %>% mutate(lower_CI = estimate - (1.96*se.fit)) %>% mutate(upper_CI = estimate + (1.96*se.fit))
+gfr_coefplot <- select(gfr_hazards, c("estimate", "lower_CI", "upper_CI", "variable"))[2:5,]
+
+# Collecting US-TRS estimates and CIs
+df_coefplot <- as.data.frame(summary(us_trs)$conf.int)[,c(1,3,4)]
+df_coefplot$variable <- rownames(df_coefplot)
+rownames(df_coefplot) <- NULL
+colnames(df_coefplot) <- c('estimate', 'lower_CI', 'upper_CI', 'variable')
+df_coefplot <- df_coefplot |> filter(variable != "frailty(center_id)")
+
+#Filter out variables that used spline
+df_coefplot <- df_coefplot |> filter(!(str_detect(variable, '^rcs')))
+
+#Note that I am naming this "Indication: CHD/VHD" to make it simpler to plot with the French-TRS model, but for the US-TRS model, only CHD is used
+df_coefplot$variable <- c('Indication: CHD/VHD', 
+                          'Diabetes', 'Mechanical ventilation', 
+                          'Durable LVAD',
+                          'Log bilirubin', 'Albumin',
+                          'Donor age over 55', 'Female donor', 'Size mismatch')
+
+#Append age and GFR dataframes
+df_coefplot <- rbind(df_coefplot, age_coefplot, gfr_coefplot)
+
+df_coefplot[nrow(df_coefplot) + 1,] = c(NA, NA, NA, "History of cardiac surgery")
+
+df_coefplot <- df_coefplot |> 
+  mutate(estimate = as.numeric(estimate),
+         lower_CI = as.numeric(lower_CI),
+         upper_CI = as.numeric(upper_CI))
+
+```
+
+
+
+#Create dataframe of hazard ratios for French-TRS that will be used for forest plots
+```{r}
+
+#Create age-only dataframe
+risks_french <- predict(french_trs, newdata=patients, type="risk", se.fit=TRUE)
+age_hazards_french <- as.data.frame(risks_french)
+age_hazards_french$variable = rbind('Age 40', 'Recipient Age 50 [v. 40]', 'Recipient Age 60 [v. 40]', 'Recipient Age 70 [v. 40]')
+risk40_french = age_hazards_french$fit[1]
+age_hazards_french <- age_hazards_french %>% mutate(estimate = fit/risk40_french) %>% mutate(lower_CI = estimate - (1.96*se.fit)) %>% mutate(upper_CI = estimate + (1.96*se.fit)) 
+age_coefplot_french <- select(age_hazards_french, c("estimate", "lower_CI", "upper_CI", "variable"))[2:4,]
+
+#Create GFR-only dataframe
+risks_GFR_french <- predict(french_trs, newdata=patients_GFR, type="risk", se.fit=TRUE)
+gfr_hazards_french <- as.data.frame(risks_GFR_french)
+gfr_hazards_french$variable = rbind('eGFR=100', 'eGFR=60 [v. 100]', 'eGFR=40 [v. 100]', 'eGFR=20 [v. 100]', 'eGFR=0 [v. 100]')
+risk100_french = gfr_hazards_french$fit[1]
+gfr_hazards_french <- gfr_hazards_french %>% mutate(estimate = fit/risk100_french) %>% mutate(lower_CI = estimate - (1.96*se.fit)) %>% mutate(upper_CI = estimate + (1.96*se.fit))
+gfr_coefplot_french <- select(gfr_hazards_french, c("estimate", "lower_CI", "upper_CI", "variable"))[2:5,]
+
+# Collecting French TRS estimates and CIs
+df_coefplot_french <- as.data.frame(summary(french_trs)$conf.int)[,c(1,3,4)]
+df_coefplot_french$variable <- rownames(df_coefplot_french)
+rownames(df_coefplot_french) <- NULL
+colnames(df_coefplot_french) <- c('estimate', 'lower_CI', 'upper_CI', 'variable')
+df_coefplot_french <- df_coefplot_french |> filter(variable != "frailty(center_id)") |> filter(variable != "age_over_50") |> filter(variable != "log_eGFR")
+
+df_coefplot_french$variable <- c('Indication: CHD/VHD', 
+                                 'Diabetes', 
+                                 'History of cardiac surgery',
+                                 'Mechanical ventilation',
+                                 'Log bilirubin',
+                                 'Donor age over 55', 
+                                 'Female donor')
+
+df_coefplot_french <- rbind(df_coefplot_french, age_coefplot_french, gfr_coefplot_french)
+
+df_coefplot_french[nrow(df_coefplot_french) + 1,] = c(NA, NA, NA, "Albumin")
+df_coefplot_french[nrow(df_coefplot_french) + 1,] = c(NA, NA, NA, "Durable LVAD")
+df_coefplot_french[nrow(df_coefplot_french) + 1,] = c(NA, NA, NA, "Size mismatch")
+
+df_coefplot_french <- df_coefplot_french |> 
+  mutate(estimate = as.numeric(estimate),
+         lower_CI = as.numeric(lower_CI),
+         upper_CI = as.numeric(upper_CI))
+
+```
+
+
+# Figure 2: Combined US TRS and French TRS forest plot
+
+```{r, warning=F, echo=F, message=F, comment=NA, fig.align='center', fig.height=12, fig.width=9}
+
+df_coefplot_french <- df_coefplot_french |> 
+  mutate(model = "French")
+
+df_coefplot <- df_coefplot |> 
+  mutate(model = "US")
+
+df_coefplot_combo <- df_coefplot |> rbind(df_coefplot_french)
+
+df_coefplot_combo <- df_coefplot_combo |> 
+  mutate(estimate = as.numeric(estimate),
+         lower_CI = as.numeric(lower_CI),
+         upper_CI = as.numeric(upper_CI))
+
+forest_plot <- df_coefplot_combo %>%
+  ggplot(aes(x=estimate, 
+             y=factor(variable, 
+                      levels = c('Size mismatch',
+                                 'Durable LVAD',
+                                 'Albumin',
+                                 'Female donor', 
+                                 'Donor age over 55',
+                                 'Indication: CHD/VHD', 
+                                 'Mechanical ventilation',
+                                 'Diabetes',
+                                 'Log bilirubin',
+                                 'Recipient Age 50 [v. 40]', 
+                                 'Recipient Age 60 [v. 40]', 
+                                 'Recipient Age 70 [v. 40]', 
+                                 'eGFR=60 [v. 100]', 
+                                 'eGFR=40 [v. 100]', 
+                                 'eGFR=20 [v. 100]', 
+                                 'eGFR=0 [v. 100]',
+                                 'History of cardiac surgery')),
+             color=model)) +
+  geom_point(size = 3.25, position = position_dodge(width = 0.7)) +
+  geom_errorbarh(aes(xmin = lower_CI, xmax = upper_CI), position = position_dodge(width = 0.7)) +
+  geom_vline(xintercept = 1, lty = 2, color = '#880d1e', linewidth = 0.3) +
+  xlab('Hazard Ratio (95% CI)') + xlim(0, 5) +
+  scale_x_log10(n.breaks = 6) +
+  # labs(caption = paste0("\u1D43", "Variable scaled by factor of 10")) +
+  scale_y_discrete(labels=c('Size mismatch',
+                            'Durable LVAD',
+                            'Albumin',
+                            'Female donor',
+                            'Donor age over 55',
+                            expression('Transplant indication'^'c'),
+                            'Mechanical ventilation',
+                            'Diabetes',
+                            'Log bilirubin',
+                            expression('Recipient age 50 [v. 40]'^'b'),
+                            expression('Recipient age 60 [v. 40]'^'b'),
+                           expression('Recipient age 70 [v. 40]'^'b'),
+                           expression('eGFR=60 [v. 100]'^'a'),
+                           expression('eGFR=40 [v. 100]'^'a'),
+                           expression('eGFR=20 [v. 100]'^'a'),
+                           expression('eGFR=0 [v. 100]'^'a'),
+                            'History of cardiac surgery')) +
+  scale_colour_manual(name='Model',
+                      breaks = c('US', 'French'),
+                      values = c('#880d1e', '#3f88c5'),
+                      labels = c('US-TRS', 'French TRS')) +
+  theme_bw() +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        axis.title.x = element_text(size = 15, margin = margin(t=5)), 
+        axis.text.x = element_text(size = 15, margin = margin(t=5)), 
+        axis.title.y = element_blank(),
+        axis.text.y = element_text(size = 15, margin = margin(r=5)),
+        legend.text = element_text(size = 15),
+        legend.title = element_text(size = 15),
+        plot.caption = element_text(hjust=0, size = 15))
+
+ggsave("us_trs_french_trs_forest_plot.png")
+forest_plot
+
+```
+
+
+
+# Figure 3a: Kaplan-Meier curves by US TRS score
+
+```{r, warning=F, echo=F, message=F, comment=NA, fig.align='center', fig.height=6, fig.width=7}
+
+data_test_temporal <- data_test_temporal |> 
+  mutate(risk_group = case_when(
+    US_TRS_score > 9.5 ~ 0,
+    US_TRS_score <= 9.5 & US_TRS_score >= 9 ~ 1,
+    US_TRS_score < 9 ~ 2),
+    risk_group = factor(risk_group,
+                        levels = c(0, 1, 2),
+                        labels = c("US-TRS > 9.5", 
+                                   "US-TRS 9-9.5",
+                                   "US-TRS < 9")))
+
+us_trs_km <- surv_fit(Surv(surv_time_365, surv_status_365) ~ risk_group,
+                            data = data_test_temporal,
+                            stype = 1,
+                            ctype = 1,
+                            conf.type = "log")
+  
+#Saved manually as kaplan_meier_by_us_trs.png
+ggsurvplot(
+  us_trs_km,                 
+  pval = TRUE,                     
+  conf.int = TRUE,                 
+  conf.int.style = "ribbon",       
+  xlab = "Time since transplantation (days)", 
+  ggtheme = custom_theme(),
+  break.time.by = 90,
+  risk.table = "absolute",         
+  risk.table.height = 0.3,        
+  risk.table.y.text.col = TRUE,    
+  risk.table.y.text = TRUE,
+  risk.table.fontsize = 4,
+  font.x = c(20),
+  font.y = c(20),
+  font.tickslab = c(20, "plain"),
+  font.legend = c(14),
+  ncensor.plot = FALSE,
+  surv.median.line = "none", 
+  legend.labs = 
+    c(" US-TRS > 9.5 (RMST > 346.75)", " US-TRS 9-9.5 (RMST 328.5-346.75)", " US-TRS < 9 (RMST < 328.5)"),
+  legend = c(0.6, 0.25),
+  legend.title = "",
+  xlim = c(0, 365),             
+  linetype = c("solid", "solid", "solid"), 
+  ylim = c(0, 1),   
+  censor = FALSE,
+  palette = c('#3f88c5', '#a37c40', '#880d1e'))
+
+```
+
+
+
+#Reimann sums of the survival curves to calculate RMST for US-TRS groups
+```{r}
+
+low_risk <- data_test_temporal |> filter(risk_group=='US-TRS > 9.5')
+medium_risk <- data_test_temporal |> filter(risk_group=="US-TRS 9-9.5")
+high_risk <- data_test_temporal |> filter(risk_group=='US-TRS < 9')
+
+reimann_sum <- function(df, n){
+  #Create survival curve for risk group
+  fit <- survfit(Surv(surv_time_365, surv_status_365) ~ 1, data = df)
+  #Create a dataframe with the time and probability of survival as variables
+  surv_df <- data.frame(time=fit$time, surv=fit$surv)
+  #Initiatalize sum
+  reim_sum = 0
+  #We will do a Reimann sum over 365 days; however, the survfit function only provides time/survival values for time points where a change has occurred
+  #The fill_down variable carries forward the most recent value to reflect these periods without change.
+  fill_down = 1
+  #We now sum over 365 intervals of the curve, where each rectangle of the Reimann sum is one day wide, and has the value of the survival probability at time i
+  for (ind in 1:365) {
+    i = ind - 1
+    #Check if day "i" is included in the time values returned by survfit
+    if (i %in% fit$time) {
+      surv_i <- surv_df |> filter(time==i)
+      reim_sum = reim_sum + surv_i$surv
+      fill_down = surv_i$surv
+    }
+    #If not, use whatever value is being carried forward
+    else {
+      reim_sum = reim_sum + fill_down
+      }
+  }
+  return(reim_sum)
+  }
+
+
+rmst_high = reimann_sum(df=high_risk, n=365)
+print('High risk')
+print(rmst_high)
+rmst_medium = reimann_sum(df=medium_risk, n=365)
+print('Medium_risk')
+print(rmst_medium)
+rmst_low = reimann_sum(df=low_risk, n=365)
+print('Low risk')
+print(rmst_low)
+
+```
+# Figure 3b: Kaplan-Meier curves by waitlist status
+``````{r, warning=F, echo=F, message=F, comment=NA, fig.align='center', fig.height=6, fig.width=7}
+
+data_test_temporal <- data_test_temporal |> 
+  mutate(status_for_km = case_when(
+    curr_list_status_factor == 'Status 1' ~ 0,
+    curr_list_status_factor == 'Status 2' ~ 1,
+    curr_list_status_factor == 'Status 3' ~ 2,
+    curr_list_status_factor == 'Status 4' ~ 3,
+    curr_list_status_factor == 'Status 5' ~ 4,
+    curr_list_status_factor == 'Status 6' ~ 5),
+
+    status_for_km = factor(status_for_km,
+                        levels = c(0, 1, 2, 3, 4, 5),
+                        labels = c("Status 1", "Status 2", "Status 3", "Status 4", "Status 5", "Status 6")))
+
+status_km <- surv_fit(Surv(surv_time_365, surv_status_365) ~ status_for_km,
+                            data = data_test_temporal,
+                            stype = 1,
+                            ctype = 1,
+                            conf.type = "log")
+  
+#Saved manually as kaplan_meier_by_status.png
+ggsurvplot(
+  status_km,                 
+  pval = TRUE,                     
+  #conf.int = TRUE,                 
+  conf.int.style = "ribbon",    
+  xlab = "Time since transplantation (days)", 
+  ggtheme = custom_theme(),
+  break.time.by = 90,
+  risk.table = "absolute",         
+  risk.table.height = 0.3,        
+  risk.table.y.text.col = TRUE,    
+  risk.table.y.text = TRUE,
+  risk.table.fontsize = 3,
+  font.x = c(20),
+  font.y = c(20),
+  font.tickslab = c(20, "plain"),
+  font.legend = c(14),
+  ncensor.plot = FALSE,
+  surv.median.line = "none", 
+  legend.labs = 
+    c("Status 1", "Status 2", "Status 3", "Status 4", "Status 5", "Status 6"),
+  legend = c(0.8, 0.4),
+  legend.title = "",
+  xlim = c(0, 365),             
+  linetype = c("solid", "solid", "solid", "solid", "solid", "solid"), 
+  ylim = c(0, 1),   
+  censor = FALSE,
+  palette = c('#880d1e', '#a37c40', 'wheat3', '#3f88c5', 'grey', '#07090f'))
+
+
+```
+
+
+
+# Figure 4: Calibration plot (observed mortality by decile of RMST)
+
+```{r}
+
+
+# Observed and predicted mortality
+us_trs_pred_surv <- us_trs_predicted$survival[,365]
+
+observed_mortality_by_decile <- data_test_temporal |> 
+  
+  group_by(US_TRS_decile) |> 
+  
+  summarise(num_deaths = sum(surv_status_365),
+            num_pts_at_decile = n(),
+            mean_pred_rmst = mean(rmst_test),
+            mean_obs_rmst = mean(surv_time_365),
+            sd_obs_rmst = sd(surv_time_365)) |> 
+  
+  mutate(se = sd_obs_rmst/sqrt(num_pts_at_decile),
+         upper_ci = mean_obs_rmst + 1.96*se,
+         lower_ci = mean_obs_rmst - 1.96*se)
+
+calibration_lm <- lm(mean_obs_rmst ~ mean_pred_rmst,
+                     data = observed_mortality_by_decile)
+
+summary(calibration_lm)
+
+observed_mortality_by_decile |> 
+  ggplot(mapping = aes(x = mean_pred_rmst, y = mean_obs_rmst)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci)) +
+  geom_abline(slope = 1, intercept = 0, color = 'black', linetype = 2) +
+  theme_bw() + 
+    theme(
+    panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+    axis.title.x = element_text(size = 18, margin = margin(t=5)), 
+    axis.text.x = element_text(size = 18, margin = margin(t=5)), 
+    axis.title.y = element_text(size = 18, margin = margin(r=5)),
+    axis.text.y = element_text(size = 18, margin = margin(r=5)),
+    legend.title = element_text(size = 18),
+    legend.text = element_text(size = 18),
+    strip.text = element_text(size = 18, face = 'bold', color = 'black'),
+    strip.background = element_blank())   +
+  xlab("Predicted 1-year RMST") +
+  ylab("Observed 1-year RMST") +
+  xlim(280,365) +
+  ylim(280,365)
+
+ggsave("calibration.png")
+```
+
+
+# US TRS by waitlist status at transplant
+
+```{r}
+data_test_temporal %>%
+  mutate(curr_list_status_factor = factor(curr_list_status_factor,
+                                   levels =
+                                     c("Status 1",
+                                       "Status 2",
+                                       "Status 3",
+                                       "Status 4",
+                                       "Status 5",
+                                       "Status 6"))) |>
+  filter(!is.na(curr_list_status_factor)) %>%
+  ggplot(aes(x = US_TRS_score, fill = curr_list_status_factor)) +
+  scale_fill_manual(name = 'Status', values = c('#880d1e', '#a37c40', 'wheat3', '#3f88c5', 'grey', '#07090f')) +
+  geom_histogram(bins = 10) +  
+  xlab('US Transplant Risk Score') + ylab('Number of Recipients') +
+  scale_x_continuous(breaks=c(2, 4, 6, 8, 10)) +
+  theme_bw() + 
+    theme(
+    panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+    axis.title.x = element_text(size = 15, margin = margin(t=5)), 
+    axis.text.x = element_text(size = 15, margin = margin(t=5)), 
+    axis.title.y = element_text(size = 15, margin = margin(r=5)),
+    axis.text.y = element_text(size = 14, margin = margin(r=5)),
+    legend.title = element_text(size = 15),
+    legend.text = element_text(size = 15),
+    strip.text = element_text(size = 16, face = 'bold', color = 'black'),
+    strip.background = element_blank()) +
+  facet_wrap(~ curr_list_status_factor)
+
+ggsave("score_by_status.png")
+```
+
+# Test for sufficiency by sex and race/ethnicity
+
+```{r}
+
+# Female recipients
+observed_mortality_by_decile_female <- data_test_temporal |> 
+  
+  filter(cand_sex_factor == "Female") |> 
+  
+  group_by(US_TRS_decile) |> 
+  
+  summarise(num_deaths = sum(surv_status_365),
+            num_pts_at_decile = n(),
+            mean_pred_rmst = mean(rmst_test),
+            mean_obs_rmst = mean(surv_time_365),
+            sd_obs_rmst = sd(surv_time_365)) |> 
+  
+  mutate(se = sd_obs_rmst/sqrt(num_pts_at_decile),
+         upper_ci = mean_obs_rmst + 1.96*se,
+         lower_ci = mean_obs_rmst - 1.96*se)
+
+observed_mortality_by_decile_female <- observed_mortality_by_decile_female |> mutate(upper_ci = case_when(upper_ci > 365 ~ 365, TRUE ~ upper_ci))
+
+calibration_lm_female <- lm(mean_obs_rmst ~ mean_pred_rmst,
+                     data = observed_mortality_by_decile_female)
+
+print(summary(calibration_lm_female))
+
+female_calibration <- observed_mortality_by_decile_female |> 
+  ggplot(mapping = aes(x = mean_pred_rmst, y = mean_obs_rmst)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci)) +
+  geom_abline(slope = 1, intercept = 0, color = 'black', linetype = 2) +
+  theme_bw() + 
+    theme(
+    panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+    axis.title.x = element_text(size = 10, margin = margin(t=5)), 
+    axis.text.x = element_text(size = 10, margin = margin(t=5)), 
+    axis.title.y = element_text(size = 10, margin = margin(r=5)),
+    axis.text.y = element_text(size = 10, margin = margin(r=5)),
+    legend.title = element_text(size =10),
+    legend.text = element_text(size =10),
+    strip.text = element_text(size = 10, face = 'bold', color = 'black'),
+    strip.background = element_blank())   +
+  xlab("Predicted 1-year RMST") +
+  ylab("Observed 1-year RMST") +
+  labs(title = "Female recipients") +
+  xlim(260,370) +
+  ylim(260,370)
+
+
+#Male recipients
+
+observed_mortality_by_decile_male <- data_test_temporal |> 
+  
+  filter(cand_sex_factor == "Male") |> 
+  
+  group_by(US_TRS_decile) |> 
+  
+  summarise(num_deaths = sum(surv_status_365),
+            num_pts_at_decile = n(),
+            mean_pred_rmst = mean(rmst_test),
+            mean_obs_rmst = mean(surv_time_365),
+            sd_obs_rmst = sd(surv_time_365)) |> 
+  
+  mutate(se = sd_obs_rmst/sqrt(num_pts_at_decile),
+         upper_ci = mean_obs_rmst + 1.96*se,
+         lower_ci = mean_obs_rmst - 1.96*se)
+
+observed_mortality_by_decile_male <- observed_mortality_by_decile_male |> mutate(upper_ci = case_when(upper_ci > 365 ~ 365, TRUE ~ upper_ci))
+
+calibration_lm_male <- lm(mean_obs_rmst ~ mean_pred_rmst,
+                     data = observed_mortality_by_decile_male)
+
+print(summary(calibration_lm_male))
+
+male_calibration <- observed_mortality_by_decile_male |> 
+  ggplot(mapping = aes(x = mean_pred_rmst, y = mean_obs_rmst)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci)) +
+  geom_abline(slope = 1, intercept = 0, color = 'black', linetype = 2) +
+  theme_bw() + 
+    theme(
+    panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+    axis.title.x = element_text(size = 10, margin = margin(t=5)), 
+    axis.text.x = element_text(size = 10, margin = margin(t=5)), 
+    axis.title.y = element_text(size = 10, margin = margin(r=5)),
+    axis.text.y = element_text(size = 10, margin = margin(r=5)),
+    legend.title = element_text(size =10),
+    legend.text = element_text(size =10),
+    strip.text = element_text(size = 10, face = 'bold', color = 'black'),
+    strip.background = element_blank())   +
+  xlab("Predicted 1-year RMST") +
+  ylab("Observed 1-year RMST") +
+  labs(title = "Male recipients") +
+  xlim(260,370) +
+  ylim(260,370)
+
+
+#White recipients
+
+observed_mortality_by_decile_white <- data_test_temporal |> 
+  
+  filter(race == "White") |> 
+  
+  group_by(US_TRS_decile) |> 
+  
+  summarise(num_deaths = sum(surv_status_365),
+            num_pts_at_decile = n(),
+            mean_pred_rmst = mean(rmst_test),
+            mean_obs_rmst = mean(surv_time_365),
+            sd_obs_rmst = sd(surv_time_365)) |> 
+  
+  mutate(se = sd_obs_rmst/sqrt(num_pts_at_decile),
+         upper_ci = mean_obs_rmst + 1.96*se,
+         lower_ci = mean_obs_rmst - 1.96*se)
+
+observed_mortality_by_decile_white <- observed_mortality_by_decile_white |> mutate(upper_ci = case_when(upper_ci > 365 ~ 365, TRUE ~ upper_ci))
+
+calibration_lm_white <- lm(mean_obs_rmst ~ mean_pred_rmst,
+                     data = observed_mortality_by_decile_white)
+
+print(summary(calibration_lm_white))
+
+white_calibration <- observed_mortality_by_decile_white |> 
+  ggplot(mapping = aes(x = mean_pred_rmst, y = mean_obs_rmst)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci)) +
+  geom_abline(slope = 1, intercept = 0, color = 'black', linetype = 2) +
+  theme_bw() + 
+    theme(
+    panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+    axis.title.x = element_text(size = 10, margin = margin(t=5)), 
+    axis.text.x = element_text(size = 10, margin = margin(t=5)), 
+    axis.title.y = element_text(size = 10, margin = margin(r=5)),
+    axis.text.y = element_text(size = 10, margin = margin(r=5)),
+    legend.title = element_text(size =10),
+    legend.text = element_text(size =10),
+    strip.text = element_text(size = 10, face = 'bold', color = 'black'),
+    strip.background = element_blank())   +
+  xlab("Predicted 1-year RMST") +
+  ylab("Observed 1-year RMST") +
+  labs(title = "White recipients") +
+  xlim(260,370) +
+  ylim(260,370)
+
+
+#Non-white recipients
+
+observed_mortality_by_decile_non_white <- data_test_temporal |> 
+  
+  filter(race != "White") |> 
+  
+  group_by(US_TRS_decile) |> 
+  
+  summarise(num_deaths = sum(surv_status_365),
+            num_pts_at_decile = n(),
+            mean_pred_rmst = mean(rmst_test),
+            mean_obs_rmst = mean(surv_time_365),
+            sd_obs_rmst = sd(surv_time_365)) |> 
+  
+  mutate(se = sd_obs_rmst/sqrt(num_pts_at_decile),
+         upper_ci = mean_obs_rmst + 1.96*se,
+         lower_ci = mean_obs_rmst - 1.96*se)
+
+observed_mortality_by_decile_non_white <- observed_mortality_by_decile_non_white |> mutate(upper_ci = case_when(upper_ci > 365 ~ 365, TRUE ~ upper_ci))
+
+calibration_lm_non_white <- lm(mean_obs_rmst ~ mean_pred_rmst,
+                     data = observed_mortality_by_decile_non_white)
+
+print(summary(calibration_lm_non_white))
+
+non_white_calibration <- observed_mortality_by_decile_non_white |> 
+  ggplot(mapping = aes(x = mean_pred_rmst, y = mean_obs_rmst)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci)) +
+  geom_abline(slope = 1, intercept = 0, color = 'black', linetype = 2) +
+  theme_bw() + 
+    theme(
+    panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+    axis.title.x = element_text(size = 10, margin = margin(t=5)), 
+    axis.text.x = element_text(size = 10, margin = margin(t=5)), 
+    axis.title.y = element_text(size = 10, margin = margin(r=5)),
+    axis.text.y = element_text(size = 10, margin = margin(r=5)),
+    legend.title = element_text(size =10),
+    legend.text = element_text(size =10),
+    strip.text = element_text(size = 10, face = 'bold', color = 'black'),
+    strip.background = element_blank())   +
+  xlab("Predicted 1-year RMST") +
+  ylab("Observed 1-year RMST") +
+  labs(title = "Non-White recipients") +
+  xlim(260,370) +
+  ylim(260,370)
+
+
+
+cowplot::plot_grid(female_calibration, 
+                   male_calibration,
+                   white_calibration,
+                   non_white_calibration, ncol=2, labels='auto', scale=0.9)
+
+ggsave("calibration_stratified_by_sex_and_race.png")
+
+```
+
+# Table 1: Summary table
+
+```{r}
+
+train_temporal_PX_IDs <- data_train_temporal |> pull(PX_ID)
+
+final_list_at_tx <- final_list_at_tx |> 
+  mutate(which_set = if_else(PX_ID %in% train_temporal_PX_IDs, 0, 1), 
+         which_set_factor = factor(which_set,
+                                   levels = c(0, 1),
+                                   labels = c("Training set", "Testing set")))
+
+final_list_at_tx <- final_list_at_tx |> set_variable_labels(
+  surv_status_365_factor = "Survival status at 1 year",
+  durable_LVAD = "Durable LVAD",
+  donor_sex_factor = "Donor sex",
+  diabetes_factor = "History of diabetes",
+  cand_sex_factor = "Recipient sex",
+  diagnosis_factor = "Indication for transplant",
+  mech_vent_factor = "Mechanical ventilation",
+  mech_vent = "Mechanical ventilation",
+  race = "Race",
+  rec_age = "Recipient age at transplant (yrs)",
+  eGFR = "eGFR",
+  bilirubin = "Total bilirubin",
+  albumin = "Serum albumin",
+  donor_age = "Donor age (yrs)",
+  PHM_rec = "Recipient predicted heart mass",
+  PHM_don = "Donor predicted heart mass",
+  hx_card_surg = "History of cardiac surgery",
+  IMPACT_score = "IMPACT score",
+  curr_list_status_factor = "Waitlist status at transplant",
+  ethnicity = "Ethnicity")
+
+summary_table <- final_list_at_tx |> select(
+  
+  rec_age,
+  cand_sex_factor,
+  race,
+  diagnosis_factor,
+  multi_organ,
+  curr_list_status_factor,
+  hx_card_surg,
+  diabetes,
+  infection,
+  dialysis,
+  PHM_rec,
+  mech_vent,
+  short_MCS_ever,
+  durable_LVAD,
+  eGFR,
+  bilirubin,
+  albumin,
+  donor_age,
+  donor_sex_factor,
+  PHM_don,
+  ethnicity,
+  which_set_factor) |> 
+  
+  mutate(curr_list_status_factor = factor(curr_list_status_factor,
+                                   levels =
+                                     c("Status 1",
+                                       "Status 2",
+                                       "Status 3",
+                                       "Status 4",
+                                       "Status 5",
+                                       "Status 6"))) |>
+  filter(!is.na(curr_list_status_factor)) |> 
+  
+  set_variable_labels(curr_list_status_factor = "Waitlist status at transplant") |> 
+  
+  tbl_summary(by = which_set_factor) |> 
+  add_p()
+
+summary_table
+
+summary_table |> 
+  as_gt() |> 
+  gtsave(
+    filename = "us_trs_table1.rtf")
+
+```
+
+# Summary table not split into training and test sets
+
+```{r}
+
+final_list_at_tx |> select(
+  
+  rec_age,
+  cand_sex_factor,
+  race,
+  waitlist_time,
+  diagnosis_factor,
+  multi_organ,
+  curr_list_status_factor,
+  surv_status_365_factor,
+  diabetes_factor,
+  infection,
+  dialysis,
+  mech_vent_factor,
+  short_MCS_ever,
+  durable_LVAD,
+  eGFR,
+  log_bilirubin,
+  albumin,
+  donor_age,
+  donor_sex_factor,
+  PHM_rec,
+  PHM_don,
+  hx_card_surg,
+  which_set_factor, 
+  ethnicity,
+  PX_ID) |> 
+  
+  mutate(curr_list_status_factor = factor(curr_list_status_factor,
+                                   levels =
+                                     c("Status 1",
+                                       "Status 2",
+                                       "Status 3",
+                                       "Status 4",
+                                       "Status 5",
+                                       "Status 6"))) |>
+  filter(!is.na(curr_list_status_factor)) |> 
+  
+  set_variable_labels(curr_list_status_factor = "Waitlist status at transplant") |> 
+  
+  left_join(tx_hr |> select(PERS_ID, PX_ID), by = "PX_ID") |> 
+  
+  distinct(PERS_ID, .keep_all = TRUE) |> 
+  
+  tbl_summary(statistic = list(all_continuous() ~ "{mean} ({sd})"))
+
+```
+#Counting deaths
+```{r}
+print('Number of deaths in training set')
+print(sum(data_train_temporal$surv_status_365))
+print('Number of deaths in testing set')
+print(sum(data_test_temporal$surv_status_365))
+```
+
+#Counting retransplants
+```{r}
+retransplanted <- tx_hr |> 
+  filter(!is.na(PERS_RETX)) |> 
+  select(PX_ID, PERS_ID, REC_TX_DT, PERS_RELIST, PERS_RETX, TFL_LASTATUS) |>
+  mutate(difference = PERS_RETX - REC_TX_DT) |> 
+  filter(difference <= 365)
+
+training_retransplant <- data_train_temporal |> filter(PX_ID %in% retransplanted$PX_ID)
+print('Number of transplants in training set with retransplant within one year')
+print(nrow(training_retransplant))
+testing_retransplant <- data_test_temporal |> filter(PX_ID %in% retransplanted$PX_ID)
+print('Number of transplants in testing set with retransplant within one year')
+print(nrow(testing_retransplant))
+
+retransplanted_later <- tx_hr |> 
+  filter(!is.na(PERS_RETX)) |> 
+  select(PX_ID, PERS_ID, REC_TX_DT, PERS_RELIST, PERS_RETX, TFL_LASTATUS) |>
+  mutate(difference = PERS_RETX - REC_TX_DT) |> 
+  filter(difference > 365)
+
+training_retransplant_later <- data_train_temporal |> filter(PX_ID %in% retransplanted_later$PX_ID)
+print('Number of transplants in training set with retransplant after one year')
+print(nrow(training_retransplant_later))
+testing_retransplant_later <- data_test_temporal |> filter(PX_ID %in% retransplanted_later$PX_ID)
+print('Number of transplants in testing set with retransplant after one year')
+print(nrow(testing_retransplant_later))
+
+retransplanted_in_study_window <- tx_hr |> 
+  filter(!is.na(PERS_RETX)) |> 
+  select(PX_ID, PERS_ID, REC_TX_DT, PERS_RELIST, PERS_RETX, TFL_LASTATUS) |>
+  filter(PERS_RETX < mdy("3-1-2022"))
+
+
+training_retransplant <- data_train_temporal |> filter(PX_ID %in% retransplanted_in_study_window$PX_ID)
+print('Number of transplants in training set with retransplant in study time window.')
+print(nrow(training_retransplant))
+testing_retransplant <- data_test_temporal |> filter(PX_ID %in% retransplanted_in_study_window$PX_ID)
+print('Number of transplants in testing set with retransplant in study time window.')
+print(nrow(testing_retransplant))
+```
+
+# Examining number of unique recipients and retransplants
+
+```{r}
+multiple_PERS_IDs <- tx_hr |> 
+  select(PERS_ID) |> 
+  group_by(PERS_ID) |> 
+  count(sort = TRUE) |>
+  filter(n > 1) |> 
+  select(PERS_ID)
+
+retx_PERS_IDs <- tx_hr |> 
+  filter(!is.na(PERS_RETX)) |> 
+  select(PERS_ID)
+
+not_captured <- multiple_PERS_IDs |> 
+  filter(!(PERS_ID %in% retx_PERS_IDs$PERS_ID))
+
+not_captured
+
+```
+
